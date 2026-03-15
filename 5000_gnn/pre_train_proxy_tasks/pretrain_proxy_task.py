@@ -54,6 +54,7 @@ def parse_args():
     parser.add_argument("--dropout", type=float, default=0.35)
     parser.add_argument("--pooling", choices=["mean", "add"], default="mean")
     parser.add_argument("--edge_attr_dim", type=int, default=2)
+    parser.add_argument("--max_hop", type=int, default=2)
     parser.add_argument("--mask_ratio", type=float, default=0.15)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -90,12 +91,14 @@ def load_aa_feature_map(csv_path: Path):
 
     feature_cols = [col for col in df.columns if col != "1-Letter"]
     aa_to_feature = {}
+    aa_to_idx = {}
     for _, row in df.iterrows():
         aa = str(row["1-Letter"]).strip()
+        aa_to_idx[aa] = len(aa_to_idx)
         aa_to_feature[aa] = torch.tensor(
             row[feature_cols].to_numpy(dtype=np.float32), dtype=torch.float32
         )
-    return aa_to_feature, feature_cols
+    return aa_to_feature, aa_to_idx, feature_cols
 
 
 def load_embedding_table(index_csv: Path, raw_xlsx: Path):
@@ -123,23 +126,25 @@ def load_embedding_table(index_csv: Path, raw_xlsx: Path):
     return df
 
 
-def build_linear_edge_index(num_nodes: int):
+def build_linear_edge_index(num_nodes: int, max_hop: int):
     if num_nodes <= 1:
         return torch.empty((2, 0), dtype=torch.long)
 
-    src = torch.arange(0, num_nodes - 1, dtype=torch.long)
-    dst = torch.arange(1, num_nodes, dtype=torch.long)
-    edge_index = torch.stack(
-        [
-            torch.cat([src, dst], dim=0),
-            torch.cat([dst, src], dim=0),
-        ],
-        dim=0,
-    )
+    src_list = []
+    dst_list = []
+    for hop in range(1, max_hop + 1):
+        if num_nodes <= hop:
+            continue
+        src = torch.arange(0, num_nodes - hop, dtype=torch.long)
+        dst = torch.arange(hop, num_nodes, dtype=torch.long)
+        src_list.extend([src, dst])
+        dst_list.extend([dst, src])
+
+    edge_index = torch.stack([torch.cat(src_list, dim=0), torch.cat(dst_list, dim=0)], dim=0)
     return edge_index
 
 
-def build_linear_edge_attr(num_nodes: int, edge_attr_dim: int):
+def build_linear_edge_attr(num_nodes: int, edge_attr_dim: int, max_hop: int):
     if edge_attr_dim != 2:
         raise ValueError(
             f"edge_attr_dim must be 2 to match the main GINE model, but got {edge_attr_dim}."
@@ -147,10 +152,16 @@ def build_linear_edge_attr(num_nodes: int, edge_attr_dim: int):
     if num_nodes <= 1:
         return torch.empty((0, edge_attr_dim), dtype=torch.float32)
 
-    num_bonds = num_nodes - 1
-    forward_attr = torch.tensor([1.0, 0.0], dtype=torch.float32).repeat(num_bonds, 1)
-    backward_attr = torch.tensor([0.0, 1.0], dtype=torch.float32).repeat(num_bonds, 1)
-    return torch.cat([forward_attr, backward_attr], dim=0)
+    edge_attr_list = []
+    for hop in range(1, max_hop + 1):
+        if num_nodes <= hop:
+            continue
+        num_edges = num_nodes - hop
+        hop_value = float(hop)
+        forward_attr = torch.tensor([1.0, hop_value], dtype=torch.float32).repeat(num_edges, 1)
+        backward_attr = torch.tensor([-1.0, hop_value], dtype=torch.float32).repeat(num_edges, 1)
+        edge_attr_list.extend([forward_attr, backward_attr])
+    return torch.cat(edge_attr_list, dim=0)
 
 
 def _make_gine_mlp(hidden_dim: int):
@@ -171,13 +182,16 @@ class PeptideMaskingDataset(Dataset):
         index_df,
         embeddings,
         aa_to_feature,
+        aa_to_idx,
         mask_ratio: float = 0.15,
         edge_attr_dim: int = 2,
+        max_hop: int = 2,
         dynamic_mask: bool = True,
         seed: int = 42,
     ):
         self.mask_ratio = mask_ratio
         self.edge_attr_dim = edge_attr_dim
+        self.max_hop = max_hop
         self.dynamic_mask = dynamic_mask
         self.seed = seed
         self.samples = []
@@ -197,8 +211,9 @@ class PeptideMaskingDataset(Dataset):
                 continue
 
             x = torch.stack([aa_to_feature[aa].clone() for aa in aa_seq], dim=0)
-            edge_index = build_linear_edge_index(len(aa_seq))
-            edge_attr = build_linear_edge_attr(len(aa_seq), self.edge_attr_dim)
+            aa_target = torch.tensor([aa_to_idx[aa] for aa in aa_seq], dtype=torch.long)
+            edge_index = build_linear_edge_index(len(aa_seq), self.max_hop)
+            edge_attr = build_linear_edge_attr(len(aa_seq), self.edge_attr_dim, self.max_hop)
             chemberta_embedding = embeddings[embedding_idx].float().clone().view(1, -1)
 
             self.samples.append(
@@ -206,6 +221,7 @@ class PeptideMaskingDataset(Dataset):
                     x=x,
                     edge_index=edge_index,
                     edge_attr=edge_attr,
+                    aa_target=aa_target,
                     aa_seq=aa_seq,
                     chemberta_embedding=chemberta_embedding,
                 )
@@ -304,6 +320,7 @@ class PretrainNet(nn.Module):
     def __init__(
         self,
         node_input_dim: int,
+        num_aa_classes: int,
         hidden_dim: int,
         num_layers: int,
         dropout: float,
@@ -324,7 +341,7 @@ class PretrainNet(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, node_input_dim),
+            nn.Linear(hidden_dim, num_aa_classes),
         )
         self.alignment_projector = nn.Linear(hidden_dim, chemberta_dim)
 
@@ -347,7 +364,7 @@ def compute_losses(outputs, batch, align_loss: str, mask_weight: float, align_we
     if mask.sum().item() == 0:
         loss_mask = outputs["mask_pred"].sum() * 0.0
     else:
-        loss_mask = F.mse_loss(outputs["mask_pred"][mask], batch.mask_target[mask])
+        loss_mask = F.cross_entropy(outputs["mask_pred"][mask], batch.aa_target[mask])
 
     target_embedding = batch.chemberta_embedding.view(outputs["align_pred"].size(0), -1)
     if align_loss == "mse":
@@ -420,7 +437,7 @@ def main():
     embedding_index_csv = Path(args.embedding_index_csv).expanduser().resolve()
     raw_xlsx = Path(args.raw_xlsx).expanduser().resolve()
 
-    aa_to_feature, feature_cols = load_aa_feature_map(aa_feature_csv)
+    aa_to_feature, aa_to_idx, feature_cols = load_aa_feature_map(aa_feature_csv)
     embedding_payload = torch.load(embedding_pt, map_location="cpu", weights_only=False)
     embeddings = embedding_payload["embeddings"].float()
     index_df = load_embedding_table(embedding_index_csv, raw_xlsx)
@@ -429,8 +446,10 @@ def main():
         index_df=index_df,
         embeddings=embeddings,
         aa_to_feature=aa_to_feature,
+        aa_to_idx=aa_to_idx,
         mask_ratio=args.mask_ratio,
         edge_attr_dim=args.edge_attr_dim,
+        max_hop=args.max_hop,
         dynamic_mask=True,
         seed=args.seed,
     )
@@ -453,8 +472,10 @@ def main():
             index_df=train_df,
             embeddings=embeddings,
             aa_to_feature=aa_to_feature,
+            aa_to_idx=aa_to_idx,
             mask_ratio=args.mask_ratio,
             edge_attr_dim=args.edge_attr_dim,
+            max_hop=args.max_hop,
             dynamic_mask=True,
             seed=args.seed,
         )
@@ -462,8 +483,10 @@ def main():
             index_df=val_df,
             embeddings=embeddings,
             aa_to_feature=aa_to_feature,
+            aa_to_idx=aa_to_idx,
             mask_ratio=args.mask_ratio,
             edge_attr_dim=args.edge_attr_dim,
+            max_hop=args.max_hop,
             dynamic_mask=False,
             seed=args.seed,
         )
@@ -486,6 +509,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = PretrainNet(
         node_input_dim=len(feature_cols),
+        num_aa_classes=len(aa_to_idx),
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
@@ -509,6 +533,7 @@ def main():
         "val_samples": 0 if val_dataset is None else len(val_dataset),
         "num_skipped": full_dataset.num_skipped,
         "node_feature_dim": len(feature_cols),
+        "num_aa_classes": len(aa_to_idx),
         "chemberta_dim": int(embeddings.shape[1]),
         "encoder_type": "gine_virtual_node",
         "hidden_dim": args.hidden_dim,
@@ -516,7 +541,9 @@ def main():
         "dropout": args.dropout,
         "pooling": args.pooling,
         "edge_attr_dim": args.edge_attr_dim,
+        "max_hop": args.max_hop,
         "mask_ratio": args.mask_ratio,
+        "mask_task": "masked_amino_acid_classification",
         "align_loss": args.align_loss,
     }
     save_json(output_dir / "run_config.json", {**vars(args), **metadata})
