@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import balanced_accuracy_score, confusion_matrix, f1_score
 from torch.utils.data import Dataset, random_split
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
@@ -101,6 +102,40 @@ def load_aa_feature_map(csv_path: Path):
     return aa_to_feature, aa_to_idx, feature_cols
 
 
+def build_aa_property_mapping():
+    aa_to_property = {
+        "R": "positive",
+        "H": "positive",
+        "K": "positive",
+        "D": "negative",
+        "E": "negative",
+        "S": "polar_uncharged",
+        "T": "polar_uncharged",
+        "N": "polar_uncharged",
+        "Q": "polar_uncharged",
+        "A": "hydrophobic",
+        "V": "hydrophobic",
+        "I": "hydrophobic",
+        "L": "hydrophobic",
+        "M": "hydrophobic",
+        "F": "hydrophobic",
+        "Y": "hydrophobic",
+        "W": "hydrophobic",
+        "C": "special",
+        "G": "special",
+        "P": "special",
+    }
+    property_names = [
+        "positive",
+        "negative",
+        "polar_uncharged",
+        "hydrophobic",
+        "special",
+    ]
+    property_to_idx = {name: idx for idx, name in enumerate(property_names)}
+    return aa_to_property, property_to_idx, property_names
+
+
 def load_embedding_table(index_csv: Path, raw_xlsx: Path):
     if index_csv.exists():
         df = pd.read_csv(index_csv)
@@ -183,6 +218,8 @@ class PeptideMaskingDataset(Dataset):
         embeddings,
         aa_to_feature,
         aa_to_idx,
+        aa_to_property,
+        property_to_idx,
         mask_ratio: float = 0.15,
         edge_attr_dim: int = 2,
         max_hop: int = 2,
@@ -206,12 +243,16 @@ class PeptideMaskingDataset(Dataset):
                 continue
 
             unknown = [aa for aa in aa_seq if aa not in aa_to_feature]
-            if unknown:
+            unknown_property = [aa for aa in aa_seq if aa not in aa_to_property]
+            if unknown or unknown_property:
                 self.num_skipped += 1
                 continue
 
             x = torch.stack([aa_to_feature[aa].clone() for aa in aa_seq], dim=0)
             aa_target = torch.tensor([aa_to_idx[aa] for aa in aa_seq], dtype=torch.long)
+            property_target = torch.tensor(
+                [property_to_idx[aa_to_property[aa]] for aa in aa_seq], dtype=torch.long
+            )
             edge_index = build_linear_edge_index(len(aa_seq), self.max_hop)
             edge_attr = build_linear_edge_attr(len(aa_seq), self.edge_attr_dim, self.max_hop)
             chemberta_embedding = embeddings[embedding_idx].float().clone().view(1, -1)
@@ -222,6 +263,7 @@ class PeptideMaskingDataset(Dataset):
                     edge_index=edge_index,
                     edge_attr=edge_attr,
                     aa_target=aa_target,
+                    property_target=property_target,
                     aa_seq=aa_seq,
                     chemberta_embedding=chemberta_embedding,
                 )
@@ -320,7 +362,7 @@ class PretrainNet(nn.Module):
     def __init__(
         self,
         node_input_dim: int,
-        num_aa_classes: int,
+        num_property_classes: int,
         hidden_dim: int,
         num_layers: int,
         dropout: float,
@@ -342,7 +384,7 @@ class PretrainNet(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_aa_classes),
+            nn.Linear(hidden_dim, num_property_classes),
         )
         self.alignment_projector = nn.Linear(hidden_dim, chemberta_dim)
 
@@ -369,7 +411,7 @@ def compute_losses(outputs, batch, align_loss: str, mask_weight: float, align_we
         mask_accuracy = outputs["mask_pred"].sum() * 0.0
     else:
         masked_logits = outputs["mask_pred"][mask]
-        masked_targets = batch.aa_target[mask]
+        masked_targets = batch.property_target[mask]
         loss_mask = F.cross_entropy(masked_logits, masked_targets)
         mask_accuracy = (masked_logits.argmax(dim=-1) == masked_targets).float().mean()
 
@@ -395,6 +437,8 @@ def run_epoch(loader, model, optimizer, device, align_loss, mask_weight, align_w
     total_align_loss = 0.0
     total_mask_accuracy = 0.0
     total_graphs = 0
+    masked_pred_list = []
+    masked_target_list = []
 
     context = torch.enable_grad() if train else torch.no_grad()
     with context:
@@ -421,12 +465,33 @@ def run_epoch(loader, model, optimizer, device, align_loss, mask_weight, align_w
             total_align_loss += loss_align.item() * num_graphs
             total_mask_accuracy += mask_accuracy.item() * num_graphs
 
+            mask = batch.mask.bool()
+            if mask.any():
+                masked_logits = outputs["mask_pred"][mask]
+                masked_targets = batch.property_target[mask]
+                masked_pred_list.append(masked_logits.argmax(dim=-1).detach().cpu())
+                masked_target_list.append(masked_targets.detach().cpu())
+
     denom = max(total_graphs, 1)
+    if masked_target_list:
+        y_true = torch.cat(masked_target_list).numpy()
+        y_pred = torch.cat(masked_pred_list).numpy()
+        mask_balanced_accuracy = float(balanced_accuracy_score(y_true, y_pred))
+        mask_macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+        mask_confusion = confusion_matrix(y_true, y_pred).tolist()
+    else:
+        mask_balanced_accuracy = 0.0
+        mask_macro_f1 = 0.0
+        mask_confusion = []
+
     return {
         "loss": total_loss / denom,
         "loss_mask": total_mask_loss / denom,
         "loss_align": total_align_loss / denom,
         "mask_accuracy": total_mask_accuracy / denom,
+        "mask_balanced_accuracy": mask_balanced_accuracy,
+        "mask_macro_f1": mask_macro_f1,
+        "mask_confusion_matrix": mask_confusion,
     }
 
 
@@ -448,6 +513,7 @@ def main():
     raw_xlsx = Path(args.raw_xlsx).expanduser().resolve()
 
     aa_to_feature, aa_to_idx, feature_cols = load_aa_feature_map(aa_feature_csv)
+    aa_to_property, property_to_idx, property_names = build_aa_property_mapping()
     embedding_payload = torch.load(embedding_pt, map_location="cpu", weights_only=False)
     embeddings = embedding_payload["embeddings"].float()
     index_df = load_embedding_table(embedding_index_csv, raw_xlsx)
@@ -456,6 +522,8 @@ def main():
         embeddings=embeddings,
         aa_to_feature=aa_to_feature,
         aa_to_idx=aa_to_idx,
+        aa_to_property=aa_to_property,
+        property_to_idx=property_to_idx,
         mask_ratio=args.mask_ratio,
         edge_attr_dim=args.edge_attr_dim,
         max_hop=args.max_hop,
@@ -482,6 +550,8 @@ def main():
             embeddings=embeddings,
             aa_to_feature=aa_to_feature,
             aa_to_idx=aa_to_idx,
+            aa_to_property=aa_to_property,
+            property_to_idx=property_to_idx,
             mask_ratio=args.mask_ratio,
             edge_attr_dim=args.edge_attr_dim,
             max_hop=args.max_hop,
@@ -493,6 +563,8 @@ def main():
             embeddings=embeddings,
             aa_to_feature=aa_to_feature,
             aa_to_idx=aa_to_idx,
+            aa_to_property=aa_to_property,
+            property_to_idx=property_to_idx,
             mask_ratio=args.mask_ratio,
             edge_attr_dim=args.edge_attr_dim,
             max_hop=args.max_hop,
@@ -518,7 +590,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = PretrainNet(
         node_input_dim=len(feature_cols),
-        num_aa_classes=len(aa_to_idx),
+        num_property_classes=len(property_to_idx),
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
@@ -543,6 +615,8 @@ def main():
         "num_skipped": full_dataset.num_skipped,
         "node_feature_dim": len(feature_cols),
         "num_aa_classes": len(aa_to_idx),
+        "num_property_classes": len(property_to_idx),
+        "property_classes": property_names,
         "chemberta_dim": int(embeddings.shape[1]),
         "encoder_type": "gine_virtual_node",
         "hidden_dim": args.hidden_dim,
@@ -553,7 +627,7 @@ def main():
         "max_hop": args.max_hop,
         "mask_ratio": args.mask_ratio,
         "mask_input": "learnable_mask_token",
-        "mask_task": "masked_amino_acid_classification",
+        "mask_task": "masked_amino_acid_property_classification",
         "align_loss": args.align_loss,
     }
     save_json(output_dir / "run_config.json", {**vars(args), **metadata})
@@ -603,6 +677,9 @@ def main():
             "train_loss_mask": float(train_metrics["loss_mask"]),
             "train_loss_align": float(train_metrics["loss_align"]),
             "train_mask_accuracy": float(train_metrics["mask_accuracy"]),
+            "train_mask_balanced_accuracy": float(train_metrics["mask_balanced_accuracy"]),
+            "train_mask_macro_f1": float(train_metrics["mask_macro_f1"]),
+            "train_mask_confusion_matrix": json.dumps(train_metrics["mask_confusion_matrix"]),
             "best_monitor_loss": float(best_metric),
         }
         if val_metrics is not None:
@@ -612,6 +689,9 @@ def main():
                     "val_loss_mask": float(val_metrics["loss_mask"]),
                     "val_loss_align": float(val_metrics["loss_align"]),
                     "val_mask_accuracy": float(val_metrics["mask_accuracy"]),
+                    "val_mask_balanced_accuracy": float(val_metrics["mask_balanced_accuracy"]),
+                    "val_mask_macro_f1": float(val_metrics["mask_macro_f1"]),
+                    "val_mask_confusion_matrix": json.dumps(val_metrics["mask_confusion_matrix"]),
                 }
             )
         history.append(row)
@@ -622,7 +702,9 @@ def main():
                 f"train_loss={train_metrics['loss']:.6f} | "
                 f"mask={train_metrics['loss_mask']:.6f} | "
                 f"align={train_metrics['loss_align']:.6f} | "
-                f"mask_acc={train_metrics['mask_accuracy']:.4f}"
+                f"mask_acc={train_metrics['mask_accuracy']:.4f} | "
+                f"mask_bal_acc={train_metrics['mask_balanced_accuracy']:.4f} | "
+                f"mask_macro_f1={train_metrics['mask_macro_f1']:.4f}"
             )
         else:
             print(
@@ -634,7 +716,11 @@ def main():
                 f"val_mask={val_metrics['loss_mask']:.6f} | "
                 f"val_align={val_metrics['loss_align']:.6f} | "
                 f"train_mask_acc={train_metrics['mask_accuracy']:.4f} | "
-                f"val_mask_acc={val_metrics['mask_accuracy']:.4f}"
+                f"val_mask_acc={val_metrics['mask_accuracy']:.4f} | "
+                f"train_mask_bal_acc={train_metrics['mask_balanced_accuracy']:.4f} | "
+                f"val_mask_bal_acc={val_metrics['mask_balanced_accuracy']:.4f} | "
+                f"train_mask_macro_f1={train_metrics['mask_macro_f1']:.4f} | "
+                f"val_mask_macro_f1={val_metrics['mask_macro_f1']:.4f}"
             )
 
     history_df = pd.DataFrame(history)
