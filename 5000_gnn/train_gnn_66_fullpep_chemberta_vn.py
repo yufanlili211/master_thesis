@@ -92,8 +92,8 @@ def parse_args():
     )
     parser.add_argument(
         "--threshold_metric",
-        default="dual",
-        choices=["dual", "f1", "mcc"],
+        default="precision_gt_0.3_recall",
+        choices=["dual", "f1", "mcc", "precision_gt_0.3_recall"],
         help="Validation metric used to select the final classification threshold.",
     )
     return parser.parse_args()
@@ -384,7 +384,15 @@ def score_thresholds(y_true, y_prob):
 
 def select_threshold(y_true, y_prob, metric_name: str):
     threshold_df = score_thresholds(y_true, y_prob)
-    if metric_name == "dual":
+    if metric_name == "precision_gt_0.3_recall":
+        candidate_df = threshold_df[threshold_df["precision"] > 0.3]
+        if candidate_df.empty:
+            candidate_df = threshold_df
+        best_row = candidate_df.sort_values(
+            by=["recall", "precision", "f1", "mcc", "threshold"],
+            ascending=[False, False, False, False, True],
+        ).iloc[0]
+    elif metric_name == "dual":
         best_row = threshold_df.sort_values(
             by=["dual_score", "balanced_score", "f1", "mcc", "threshold"],
             ascending=[False, False, False, False, True],
