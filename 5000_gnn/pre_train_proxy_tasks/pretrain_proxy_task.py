@@ -65,10 +65,10 @@ def parse_args():
     parser.add_argument(
         "--align_weight",
         type=float,
-        default=100.0,
+        default=10.0,
         help=(
-            "Weight for ChemBERTa alignment loss. Default 100.0 makes alignment "
-            "contribute meaningfully when raw align MSE is much smaller than mask MSE."
+            "Weight for ChemBERTa alignment loss. Default 10.0 keeps alignment active "
+            "while giving the masked amino-acid prediction task more optimization focus."
         ),
     )
     parser.add_argument("--mask_weight", type=float, default=1.0)
@@ -329,6 +329,7 @@ class PretrainNet(nn.Module):
         edge_attr_dim: int = 2,
     ):
         super().__init__()
+        self.mask_token = nn.Parameter(torch.zeros(node_input_dim))
         self.encoder = GINEVirtualNodeEncoder(
             in_dim=node_input_dim,
             hidden_dim=hidden_dim,
@@ -346,8 +347,10 @@ class PretrainNet(nn.Module):
         self.alignment_projector = nn.Linear(hidden_dim, chemberta_dim)
 
     def forward(self, data):
+        masked_x = data.x.clone()
+        masked_x[data.mask.bool()] = self.mask_token.to(masked_x.dtype)
         node_emb, graph_emb = self.encoder(
-            data.x, data.edge_index, data.edge_attr, data.batch
+            masked_x, data.edge_index, data.edge_attr, data.batch
         )
         mask_pred = self.mask_predictor(node_emb)
         align_pred = self.alignment_projector(graph_emb)
@@ -363,8 +366,12 @@ def compute_losses(outputs, batch, align_loss: str, mask_weight: float, align_we
     mask = batch.mask.bool()
     if mask.sum().item() == 0:
         loss_mask = outputs["mask_pred"].sum() * 0.0
+        mask_accuracy = outputs["mask_pred"].sum() * 0.0
     else:
-        loss_mask = F.cross_entropy(outputs["mask_pred"][mask], batch.aa_target[mask])
+        masked_logits = outputs["mask_pred"][mask]
+        masked_targets = batch.aa_target[mask]
+        loss_mask = F.cross_entropy(masked_logits, masked_targets)
+        mask_accuracy = (masked_logits.argmax(dim=-1) == masked_targets).float().mean()
 
     target_embedding = batch.chemberta_embedding.view(outputs["align_pred"].size(0), -1)
     if align_loss == "mse":
@@ -374,7 +381,7 @@ def compute_losses(outputs, batch, align_loss: str, mask_weight: float, align_we
         loss_align = 1.0 - cosine.mean()
 
     total_loss = mask_weight * loss_mask + align_weight * loss_align
-    return total_loss, loss_mask.detach(), loss_align.detach()
+    return total_loss, loss_mask.detach(), loss_align.detach(), mask_accuracy.detach()
 
 
 def run_epoch(loader, model, optimizer, device, align_loss, mask_weight, align_weight, train: bool):
@@ -386,6 +393,7 @@ def run_epoch(loader, model, optimizer, device, align_loss, mask_weight, align_w
     total_loss = 0.0
     total_mask_loss = 0.0
     total_align_loss = 0.0
+    total_mask_accuracy = 0.0
     total_graphs = 0
 
     context = torch.enable_grad() if train else torch.no_grad()
@@ -393,7 +401,7 @@ def run_epoch(loader, model, optimizer, device, align_loss, mask_weight, align_w
         for batch in loader:
             batch = batch.to(device)
             outputs = model(batch)
-            loss, loss_mask, loss_align = compute_losses(
+            loss, loss_mask, loss_align, mask_accuracy = compute_losses(
                 outputs,
                 batch,
                 align_loss=align_loss,
@@ -411,12 +419,14 @@ def run_epoch(loader, model, optimizer, device, align_loss, mask_weight, align_w
             total_loss += loss.item() * num_graphs
             total_mask_loss += loss_mask.item() * num_graphs
             total_align_loss += loss_align.item() * num_graphs
+            total_mask_accuracy += mask_accuracy.item() * num_graphs
 
     denom = max(total_graphs, 1)
     return {
         "loss": total_loss / denom,
         "loss_mask": total_mask_loss / denom,
         "loss_align": total_align_loss / denom,
+        "mask_accuracy": total_mask_accuracy / denom,
     }
 
 
@@ -441,7 +451,6 @@ def main():
     embedding_payload = torch.load(embedding_pt, map_location="cpu", weights_only=False)
     embeddings = embedding_payload["embeddings"].float()
     index_df = load_embedding_table(embedding_index_csv, raw_xlsx)
-
     full_dataset = PeptideMaskingDataset(
         index_df=index_df,
         embeddings=embeddings,
@@ -543,6 +552,7 @@ def main():
         "edge_attr_dim": args.edge_attr_dim,
         "max_hop": args.max_hop,
         "mask_ratio": args.mask_ratio,
+        "mask_input": "learnable_mask_token",
         "mask_task": "masked_amino_acid_classification",
         "align_loss": args.align_loss,
     }
@@ -592,6 +602,7 @@ def main():
             "train_loss": float(train_metrics["loss"]),
             "train_loss_mask": float(train_metrics["loss_mask"]),
             "train_loss_align": float(train_metrics["loss_align"]),
+            "train_mask_accuracy": float(train_metrics["mask_accuracy"]),
             "best_monitor_loss": float(best_metric),
         }
         if val_metrics is not None:
@@ -600,6 +611,7 @@ def main():
                     "val_loss": float(val_metrics["loss"]),
                     "val_loss_mask": float(val_metrics["loss_mask"]),
                     "val_loss_align": float(val_metrics["loss_align"]),
+                    "val_mask_accuracy": float(val_metrics["mask_accuracy"]),
                 }
             )
         history.append(row)
@@ -609,7 +621,8 @@ def main():
                 f"Epoch {epoch:03d} | "
                 f"train_loss={train_metrics['loss']:.6f} | "
                 f"mask={train_metrics['loss_mask']:.6f} | "
-                f"align={train_metrics['loss_align']:.6f}"
+                f"align={train_metrics['loss_align']:.6f} | "
+                f"mask_acc={train_metrics['mask_accuracy']:.4f}"
             )
         else:
             print(
@@ -619,7 +632,9 @@ def main():
                 f"train_mask={train_metrics['loss_mask']:.6f} | "
                 f"train_align={train_metrics['loss_align']:.6f} | "
                 f"val_mask={val_metrics['loss_mask']:.6f} | "
-                f"val_align={val_metrics['loss_align']:.6f}"
+                f"val_align={val_metrics['loss_align']:.6f} | "
+                f"train_mask_acc={train_metrics['mask_accuracy']:.4f} | "
+                f"val_mask_acc={val_metrics['mask_accuracy']:.4f}"
             )
 
     history_df = pd.DataFrame(history)
