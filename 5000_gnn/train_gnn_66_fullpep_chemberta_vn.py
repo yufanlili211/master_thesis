@@ -47,6 +47,12 @@ def parse_args():
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument(
+        "--train_pos_to_neg_ratio",
+        type=float,
+        default=0.5,
+        help="Target positive:negative ratio for train-set oversampling. Default 0.5 means 1:2.",
+    )
+    parser.add_argument(
         "--disable_early_stopping",
         action="store_true",
         help="Run all epochs without early stopping.",
@@ -166,10 +172,42 @@ def build_loaders_with_seed(train_dataset, val_dataset, test_dataset, batch_size
     return train_loader, val_loader, test_loader
 
 
-def compute_pos_weight(train_loader, device):
-    y_all = []
-    for data in train_loader:
-        y_all.append(data.y.view(-1))
+def oversample_minority_class(data_list, target_ratio_pos_to_neg=0.5, seed=42):
+    pos_list = []
+    neg_list = []
+    for data in data_list:
+        label = int(data.y.view(-1)[0].item())
+        if label == 1:
+            pos_list.append(data)
+        elif label == 0:
+            neg_list.append(data)
+        else:
+            raise ValueError(f"Expected binary labels 0/1, but got {label}.")
+
+    if not neg_list or not pos_list:
+        return list(data_list)
+
+    if target_ratio_pos_to_neg <= 0:
+        raise ValueError(
+            f"target_ratio_pos_to_neg must be positive, but got {target_ratio_pos_to_neg}."
+        )
+
+    target_pos_count = int(np.ceil(len(neg_list) * target_ratio_pos_to_neg))
+    if target_pos_count <= len(pos_list):
+        oversampled_pos_list = list(pos_list)
+    else:
+        rng = random.Random(seed)
+        extra_count = target_pos_count - len(pos_list)
+        oversampled_pos_list = list(pos_list) + rng.choices(pos_list, k=extra_count)
+
+    merged_list = list(neg_list) + oversampled_pos_list
+    rng = random.Random(seed)
+    rng.shuffle(merged_list)
+    return merged_list
+
+
+def compute_pos_weight(data_list, device):
+    y_all = [data.y.view(-1) for data in data_list]
     y_all = torch.cat(y_all, dim=0)
     pos = y_all.sum().item()
     neg = len(y_all) - pos
@@ -585,8 +623,14 @@ def run_single_seed(args, model_cls, train_list, val_list, test_list, seed: int,
     output_dirs = build_output_dirs(run_dir)
     set_seed(seed)
 
+    train_list_balanced = oversample_minority_class(
+        train_list,
+        target_ratio_pos_to_neg=args.train_pos_to_neg_ratio,
+        seed=seed,
+    )
+
     train_loader, val_loader, test_loader = build_loaders_with_seed(
-        train_list, val_list, test_list, batch_size=args.batch_size, seed=seed
+        train_list_balanced, val_list, test_list, batch_size=args.batch_size, seed=seed
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -599,7 +643,7 @@ def run_single_seed(args, model_cls, train_list, val_list, test_list, seed: int,
         pooling=args.pooling,
         edge_attr_dim=train_list[0].edge_attr.size(1),
     )
-    pos_weight = compute_pos_weight(train_loader, device)
+    pos_weight = compute_pos_weight(train_list_balanced, device)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -652,13 +696,15 @@ def run_single_seed(args, model_cls, train_list, val_list, test_list, seed: int,
         "seed": int(seed),
         "monitor": args.monitor,
         "threshold_metric": args.threshold_metric,
+        "train_pos_to_neg_ratio": float(args.train_pos_to_neg_ratio),
         "selected_threshold": float(selected_threshold),
         "epochs_completed": int(train_summary["epochs_completed"]),
         "best_weights": str(train_summary["best_model_path"]),
         "best_epoch": int(train_summary["best_epoch"]),
         "best_monitor_value": float(train_summary["best_value"]),
         "best_epoch_metrics": train_summary["best_metrics"],
-        "train_samples": int(len(train_list)),
+        "train_samples": int(len(train_list_balanced)),
+        "train_samples_original": int(len(train_list)),
         "val_samples": int(len(val_list)),
         "test_samples": int(len(test_list)),
         "peptide_embedding_dim": int(peptide_emb_dim),
